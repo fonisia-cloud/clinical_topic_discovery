@@ -27,7 +27,6 @@ DATA_DIR = APP_ROOT / "data"
 DB_PATH = DATA_DIR / "app.db"
 SHOWJCR_DB_PATH = DATA_DIR / "showjcr_jcr.db"
 
-
 @st.cache_resource
 def get_repo() -> Repository:
     return Repository(str(DB_PATH))
@@ -231,12 +230,99 @@ def _translate_abstract_to_zh(
     )
 
 
+def _build_topic_followup_prompt(
+    topic_title: str,
+    rationale: str,
+    key_gap: str,
+    supporting_pmids: list[str],
+    evidence_records: list[dict],
+    requested_records: list[dict],
+    history_pairs: list[tuple[str, str]],
+    user_message: str,
+) -> str:
+    requested_lines = []
+    for row in requested_records[:10]:
+        requested_lines.append(
+            f"PMID {row.get('pmid')}: {row.get('title')} ({row.get('pub_year')}, {row.get('journal')}); "
+            f"type={row.get('publication_types', '')}; full_abstract={str(row.get('abstract', ''))[:2500]}"
+        )
+
+    evidence_lines = []
+    for row in evidence_records[:40]:
+        evidence_lines.append(
+            f"PMID {row.get('pmid')}: {row.get('title')} ({row.get('pub_year')}, {row.get('journal')}); "
+            f"type={row.get('publication_types', '')}; abstract={str(row.get('abstract', ''))[:900]}"
+        )
+
+    history_lines = []
+    for q, a in history_pairs[-6:]:
+        history_lines.append(f"User: {q}")
+        history_lines.append(f"Assistant: {a}")
+
+    return (
+        "You are a rigorous medical research advisor.\n"
+        "Use only provided evidence. Do not fabricate studies or PMIDs.\n"
+        "If user names a PMID and it is provided in requested PMID records, explicitly use that record first.\n"
+        "When giving recommendations, clearly indicate uncertainty and next validation actions.\n"
+        "Keep response concise and practical for study planning.\n\n"
+        f"Current topic: {topic_title}\n"
+        f"Rationale: {rationale}\n"
+        f"Gap: {key_gap}\n"
+        f"Supporting PMIDs: {', '.join(supporting_pmids)}\n\n"
+        "Requested PMID records (highest priority):\n"
+        + "\n".join(requested_lines)
+        + "\n\n"
+        "Evidence:\n"
+        + "\n".join(evidence_lines)
+        + "\n\nPrevious discussion:\n"
+        + "\n".join(history_lines)
+        + "\n\nUser question:\n"
+        + user_message
+    )
+
+
+def _normalize_pmid(value: object) -> str:
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def _extract_pmids_from_text(text: str) -> list[str]:
+    import re
+
+    found = re.findall(r"\b\d{7,9}\b", text or "")
+    deduped = []
+    seen = set()
+    for pmid in found:
+        if pmid in seen:
+            continue
+        seen.add(pmid)
+        deduped.append(pmid)
+    return deduped
+
+
+def _load_default_llm_session(repo: Repository) -> None:
+    if st.session_state.get("llm_profile_initialized"):
+        return
+
+    default_profile = repo.get_default_llm_profile()
+    if default_profile:
+        st.session_state["v1_ti_api_base"] = str(default_profile.get("api_base", ""))
+        st.session_state["v1_ti_api_key"] = str(default_profile.get("api_key", ""))
+        st.session_state["v1_ti_model_name"] = str(default_profile.get("model_name", ""))
+        st.session_state["v1_ti_profile_id"] = int(default_profile.get("id", 0) or 0)
+        st.session_state["v1_ti_profile_name"] = str(default_profile.get("profile_name", ""))
+    st.session_state["llm_profile_initialized"] = True
+
+
 def main() -> None:
     st.set_page_config(page_title="Clinical Topic Discovery", page_icon="🩺", layout="wide")
     st.title("Clinical Topic Discovery")
     st.caption("V1: PubMed discovery + evidence-backed topic ideas")
 
     repo = get_repo()
+    _load_default_llm_session(repo)
     default_search_weights = dict(DEFAULT_SCORE_WEIGHTS)
 
     new_run_id = run_search(repo, score_weights=default_search_weights)
@@ -595,10 +681,91 @@ def main() -> None:
 
         if enable_llm:
             with st.expander("LLM settings", expanded=True):
-                api_base = st.text_input("API base URL", value=st.session_state.get("v1_ti_api_base", "https://api.openai.com/v1"), key=f"ti_api_base_{selected_run_id}")
-                model_name = st.text_input("Model name", value=st.session_state.get("v1_ti_model_name", "gpt-4o-mini"), key=f"ti_model_{selected_run_id}")
-                api_key = st.text_input("API key", type="password", value=st.session_state.get("v1_ti_api_key", ""), key=f"ti_api_key_{selected_run_id}")
+                profiles_df = repo.list_llm_profiles()
+                if not profiles_df.empty:
+                    st.caption("Saved interfaces")
+                    st.dataframe(
+                        profiles_df[["profile_name", "api_base", "model_name", "is_default", "updated_at"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                profile_name_input = st.text_input(
+                    "接口名称",
+                    value=st.session_state.get("v1_ti_profile_name", "default"),
+                    key=f"ti_profile_name_{selected_run_id}",
+                )
+                api_base = st.text_input(
+                    "Base URL",
+                    value=st.session_state.get("v1_ti_api_base", "https://api.openai.com/v1"),
+                    key=f"ti_api_base_{selected_run_id}",
+                )
+                model_name = st.text_input(
+                    "Model",
+                    value=st.session_state.get("v1_ti_model_name", "gpt-4o-mini"),
+                    key=f"ti_model_name_{selected_run_id}",
+                )
+                api_key = st.text_input(
+                    "API Key",
+                    type="password",
+                    value=st.session_state.get("v1_ti_api_key", ""),
+                    key=f"ti_api_key_{selected_run_id}",
+                )
                 temperature = st.slider("LLM temperature", min_value=0.0, max_value=0.8, value=0.1, step=0.05, key=f"ti_temp_{selected_run_id}")
+                set_default = st.checkbox("Set as default profile", value=bool(st.session_state.get("v1_ti_profile_id", 0)), key=f"ti_profile_default_{selected_run_id}")
+
+                save_col1, save_col2, save_col3 = st.columns(3)
+                with save_col1:
+                    if st.button("Load by 接口名称", key=f"ti_profile_load_{selected_run_id}"):
+                        if profiles_df.empty:
+                            st.warning("No saved interfaces.")
+                        else:
+                            matched = profiles_df[profiles_df["profile_name"] == profile_name_input.strip()]
+                            if matched.empty:
+                                st.warning("No matching 接口名称.")
+                            else:
+                                row = matched.iloc[0]
+                                st.session_state["v1_ti_profile_id"] = int(row.get("id", 0) or 0)
+                                st.session_state["v1_ti_profile_name"] = str(row.get("profile_name", ""))
+                                st.session_state["v1_ti_api_base"] = str(row.get("api_base", ""))
+                                st.session_state["v1_ti_model_name"] = str(row.get("model_name", ""))
+                                st.session_state["v1_ti_api_key"] = str(row.get("api_key", ""))
+                                st.success("Loaded interface config.")
+                                st.rerun()
+                with save_col2:
+                    if st.button("Save new profile", key=f"ti_profile_save_new_{selected_run_id}"):
+                        new_id = repo.upsert_llm_profile(
+                            provider_name="OpenAI-compatible",
+                            profile_name=profile_name_input.strip() or "default",
+                            api_base=api_base.strip(),
+                            api_key=api_key.strip(),
+                            model_name=model_name.strip(),
+                            profile_id=None,
+                            is_default=set_default,
+                        )
+                        st.session_state["v1_ti_profile_id"] = new_id
+                        st.session_state["v1_ti_profile_name"] = profile_name_input.strip() or "default"
+                        st.success("Saved profile.")
+                        st.rerun()
+                with save_col3:
+                    if st.button("Update selected profile", key=f"ti_profile_update_{selected_run_id}"):
+                        profile_id = int(st.session_state.get("v1_ti_profile_id", 0) or 0)
+                        if profile_id <= 0:
+                            st.warning("No saved profile selected to update.")
+                        else:
+                            repo.upsert_llm_profile(
+                                provider_name="OpenAI-compatible",
+                                profile_name=profile_name_input.strip() or "default",
+                                api_base=api_base.strip(),
+                                api_key=api_key.strip(),
+                                model_name=model_name.strip(),
+                                profile_id=profile_id,
+                                is_default=set_default,
+                            )
+                            st.success("Updated profile.")
+                            st.rerun()
+
+                st.session_state["v1_ti_profile_name"] = profile_name_input.strip() or "default"
                 st.session_state["v1_ti_api_base"] = api_base
                 st.session_state["v1_ti_model_name"] = model_name
                 st.session_state["v1_ti_api_key"] = api_key
@@ -664,13 +831,131 @@ def main() -> None:
         if topic_df.empty:
             st.info("No topic candidates yet. Click 'Generate final topic ideas'.")
         else:
+            base_records_for_chat = base_df[evidence_export_cols].fillna("").to_dict(orient="records")
+            full_run_records = df[evidence_export_cols].fillna("").to_dict(orient="records")
+            pmid_record_map = {
+                _normalize_pmid(rec.get("pmid", "")): rec
+                for rec in base_records_for_chat
+                if _normalize_pmid(rec.get("pmid", ""))
+            }
+            full_run_pmid_map = {
+                _normalize_pmid(rec.get("pmid", "")): rec
+                for rec in full_run_records
+                if _normalize_pmid(rec.get("pmid", ""))
+            }
             for idx, row in topic_df.iterrows():
+                topic_title = str(row.get("topic_title", ""))
+                supporting_pmids = [_normalize_pmid(p) for p in str(row.get("supporting_pmids", "")).split(";") if _normalize_pmid(p)]
+                topic_evidence = [pmid_record_map[p] for p in supporting_pmids if p in pmid_record_map]
+                if not topic_evidence:
+                    topic_evidence = base_records_for_chat[:20]
+
                 with st.container(border=True):
-                    st.markdown(f"### {idx + 1}. {row['topic_title']}")
+                    st.markdown(f"### {idx + 1}. {topic_title}")
                     st.markdown(f"**Priority score:** {row.get('score', '-')}")
                     st.markdown(f"**Why this topic:** {row.get('rationale', '')}")
                     st.markdown(f"**Potential gap:** {row.get('key_gap', '')}")
                     st.markdown(f"**Supporting PMIDs:** {row.get('supporting_pmids', '')}")
+
+                    with st.expander("Continue discussion with LLM", expanded=False):
+                        chat_df = repo.get_topic_followups(int(selected_run_id), topic_title)
+                        if chat_df.empty:
+                            st.caption("No discussion yet. Ask your first follow-up question.")
+                            history_pairs: list[tuple[str, str]] = []
+                        else:
+                            history_pairs = []
+                            for _, hrow in chat_df.iterrows():
+                                uq = str(hrow.get("user_message", ""))
+                                aa = str(hrow.get("assistant_message", ""))
+                                history_pairs.append((uq, aa))
+                                st.markdown(f"**You:** {uq}")
+                                st.markdown(f"**LLM:** {aa}")
+                                st.markdown("---")
+
+                        followup_input_key = f"topic_followup_q_{selected_run_id}_{idx}"
+                        user_q = st.text_area(
+                            "Your follow-up question",
+                            value="",
+                            height=90,
+                            key=followup_input_key,
+                            placeholder="e.g. How to narrow this topic for a retrospective cohort study?",
+                        )
+
+                        send_col1, send_col2 = st.columns([1, 3])
+                        with send_col1:
+                            if st.button("Send to LLM", key=f"send_topic_followup_{selected_run_id}_{idx}"):
+                                api_base_chat = str(st.session_state.get("v1_ti_api_base", "")).strip()
+                                api_key_chat = str(st.session_state.get("v1_ti_api_key", "")).strip()
+                                model_name_chat = str(st.session_state.get("v1_ti_model_name", "")).strip()
+
+                                if not api_base_chat or not api_key_chat or not model_name_chat:
+                                    st.warning("Please set and save LLM interface config first in LLM settings.")
+                                elif not user_q.strip():
+                                    st.warning("Please enter a question.")
+                                else:
+                                    requested_pmids = _extract_pmids_from_text(user_q)
+                                    requested_records = [full_run_pmid_map[p] for p in requested_pmids if p in full_run_pmid_map]
+                                    missing_pmids = [p for p in requested_pmids if p not in full_run_pmid_map]
+                                    if missing_pmids:
+                                        st.info("These PMIDs are not in this run dataset: " + ", ".join(missing_pmids))
+
+                                    evidence_for_prompt: list[dict] = []
+                                    seen_pmids = set()
+                                    for rec in requested_records + topic_evidence:
+                                        key = _normalize_pmid(rec.get("pmid", ""))
+                                        if not key or key in seen_pmids:
+                                            continue
+                                        seen_pmids.add(key)
+                                        evidence_for_prompt.append(rec)
+
+                                    prompt = _build_topic_followup_prompt(
+                                        topic_title=topic_title,
+                                        rationale=str(row.get("rationale", "")),
+                                        key_gap=str(row.get("key_gap", "")),
+                                        supporting_pmids=supporting_pmids,
+                                        evidence_records=evidence_for_prompt,
+                                        requested_records=requested_records,
+                                        history_pairs=history_pairs,
+                                        user_message=user_q.strip(),
+                                    )
+                                    try:
+                                        with st.spinner("LLM is generating answer..."):
+                                            answer = call_openai_compatible(
+                                                api_base=api_base_chat,
+                                                api_key=api_key_chat,
+                                                model_name=model_name_chat,
+                                                prompt=prompt,
+                                                temperature=0.2,
+                                                timeout=180,
+                                            )
+                                        repo.save_topic_followup(
+                                            run_id=int(selected_run_id),
+                                            topic_title=topic_title,
+                                            user_message=user_q.strip(),
+                                            assistant_message=answer,
+                                        )
+                                        st.success("Discussion saved.")
+                                        st.rerun()
+                                    except Exception as exc:  # noqa: BLE001
+                                        st.error(f"Follow-up failed: {exc}")
+
+                        final_key = f"topic_final_opinion_{selected_run_id}_{idx}"
+                        if final_key not in st.session_state:
+                            st.session_state[final_key] = repo.get_topic_final_opinion(int(selected_run_id), topic_title)
+
+                        st.text_area(
+                            "Final agreed opinion (saved locally)",
+                            key=final_key,
+                            height=120,
+                            placeholder="Write the final decision after discussion, e.g. selected endpoint, cohort design, inclusion criteria focus.",
+                        )
+                        if st.button("Save final opinion", key=f"save_topic_final_{selected_run_id}_{idx}"):
+                            repo.upsert_topic_final_opinion(
+                                run_id=int(selected_run_id),
+                                topic_title=topic_title,
+                                final_opinion=str(st.session_state.get(final_key, "")).strip(),
+                            )
+                            st.success("Final opinion saved to local database.")
 
 
 if __name__ == "__main__":

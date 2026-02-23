@@ -107,6 +107,37 @@ class Repository:
                     FOREIGN KEY (pmid) REFERENCES papers(pmid)
                 );
 
+                CREATE TABLE IF NOT EXISTS llm_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider_name TEXT,
+                    profile_name TEXT UNIQUE,
+                    api_base TEXT,
+                    api_key TEXT,
+                    model_name TEXT,
+                    is_default INTEGER DEFAULT 0,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS topic_followups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER,
+                    topic_title TEXT,
+                    user_message TEXT,
+                    assistant_message TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (run_id) REFERENCES search_runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS topic_final_opinions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER,
+                    topic_title TEXT,
+                    final_opinion TEXT,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (run_id, topic_title),
+                    FOREIGN KEY (run_id) REFERENCES search_runs(id)
+                );
+
                 """
             )
 
@@ -414,10 +445,182 @@ class Repository:
                 params=(run_id,),
             )
 
+    def list_llm_profiles(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT id, provider_name, profile_name, api_base, api_key, model_name, is_default, updated_at
+                FROM llm_profiles
+                ORDER BY is_default DESC, updated_at DESC, id DESC
+                """,
+                conn,
+            )
+
+    def get_default_llm_profile(self) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, provider_name, profile_name, api_base, api_key, model_name, is_default, updated_at
+                FROM llm_profiles
+                WHERE is_default = 1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "provider_name": row[1],
+            "profile_name": row[2],
+            "api_base": row[3],
+            "api_key": row[4],
+            "model_name": row[5],
+            "is_default": row[6],
+            "updated_at": row[7],
+        }
+
+    def upsert_llm_profile(
+        self,
+        provider_name: str,
+        profile_name: str,
+        api_base: str,
+        api_key: str,
+        model_name: str,
+        profile_id: int | None = None,
+        is_default: bool = False,
+    ) -> int:
+        with self._connect() as conn:
+            if is_default:
+                conn.execute("UPDATE llm_profiles SET is_default = 0")
+
+            if profile_id is not None:
+                conn.execute(
+                    """
+                    UPDATE llm_profiles
+                    SET provider_name = ?,
+                        profile_name = ?,
+                        api_base = ?,
+                        api_key = ?,
+                        model_name = ?,
+                        is_default = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        provider_name,
+                        profile_name,
+                        api_base,
+                        api_key,
+                        model_name,
+                        1 if is_default else 0,
+                        profile_id,
+                    ),
+                )
+                return int(profile_id if profile_id is not None else 0)
+
+            existing = conn.execute("SELECT id FROM llm_profiles WHERE profile_name = ?", (profile_name,)).fetchone()
+            if existing:
+                matched_id = int(existing[0])
+                conn.execute(
+                    """
+                    UPDATE llm_profiles
+                    SET provider_name = ?,
+                        api_base = ?,
+                        api_key = ?,
+                        model_name = ?,
+                        is_default = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        provider_name,
+                        api_base,
+                        api_key,
+                        model_name,
+                        1 if is_default else 0,
+                        matched_id,
+                    ),
+                )
+                return matched_id
+
+            cur = conn.execute(
+                """
+                INSERT INTO llm_profiles (provider_name, profile_name, api_base, api_key, model_name, is_default)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    provider_name,
+                    profile_name,
+                    api_base,
+                    api_key,
+                    model_name,
+                    1 if is_default else 0,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def save_topic_followup(
+        self,
+        run_id: int,
+        topic_title: str,
+        user_message: str,
+        assistant_message: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO topic_followups (run_id, topic_title, user_message, assistant_message)
+                VALUES (?, ?, ?, ?)
+                """,
+                (run_id, topic_title, user_message, assistant_message),
+            )
+
+    def get_topic_followups(self, run_id: int, topic_title: str) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT user_message, assistant_message, created_at
+                FROM topic_followups
+                WHERE run_id = ? AND topic_title = ?
+                ORDER BY id ASC
+                """,
+                conn,
+                params=[run_id, topic_title],
+            )
+
+    def upsert_topic_final_opinion(self, run_id: int, topic_title: str, final_opinion: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO topic_final_opinions (run_id, topic_title, final_opinion, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(run_id, topic_title) DO UPDATE SET
+                    final_opinion = excluded.final_opinion,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (run_id, topic_title, final_opinion),
+            )
+
+    def get_topic_final_opinion(self, run_id: int, topic_title: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT final_opinion
+                FROM topic_final_opinions
+                WHERE run_id = ? AND topic_title = ?
+                LIMIT 1
+                """,
+                (run_id, topic_title),
+            ).fetchone()
+        return str(row[0]) if row and row[0] is not None else ""
+
     def delete_run(self, run_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM topic_candidates WHERE run_id = ?", (run_id,))
             conn.execute("DELETE FROM included_papers WHERE run_id = ?", (run_id,))
+            conn.execute("DELETE FROM topic_followups WHERE run_id = ?", (run_id,))
+            conn.execute("DELETE FROM topic_final_opinions WHERE run_id = ?", (run_id,))
             conn.execute("DELETE FROM run_papers WHERE run_id = ?", (run_id,))
             conn.execute("DELETE FROM search_runs WHERE id = ?", (run_id,))
             conn.execute(
@@ -431,6 +634,8 @@ class Repository:
         with self._connect() as conn:
             conn.execute("DELETE FROM topic_candidates")
             conn.execute("DELETE FROM included_papers")
+            conn.execute("DELETE FROM topic_followups")
+            conn.execute("DELETE FROM topic_final_opinions")
             conn.execute("DELETE FROM run_papers")
             conn.execute("DELETE FROM search_runs")
             conn.execute("DELETE FROM papers")
