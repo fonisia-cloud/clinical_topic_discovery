@@ -94,6 +94,19 @@ class Repository:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (run_id) REFERENCES search_runs(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS included_papers (
+                    run_id INTEGER,
+                    pmid TEXT,
+                    include_flag INTEGER DEFAULT 1,
+                    tags TEXT,
+                    note TEXT,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (run_id, pmid),
+                    FOREIGN KEY (run_id) REFERENCES search_runs(id),
+                    FOREIGN KEY (pmid) REFERENCES papers(pmid)
+                );
+
                 """
             )
 
@@ -335,9 +348,76 @@ class Repository:
                 params=(run_id,),
             )
 
+    def save_included_papers(self, run_id: int, rows: list[dict]) -> None:
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO included_papers (run_id, pmid, include_flag, tags, note, updated_at)
+                VALUES (:run_id, :pmid, :include_flag, :tags, :note, CURRENT_TIMESTAMP)
+                ON CONFLICT(run_id, pmid) DO UPDATE SET
+                    include_flag = excluded.include_flag,
+                    tags = excluded.tags,
+                    note = excluded.note,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [
+                    {
+                        "run_id": run_id,
+                        "pmid": str(item.get("pmid", "")),
+                        "include_flag": 1 if bool(item.get("include_flag", False)) else 0,
+                        "tags": str(item.get("tags", "") or ""),
+                        "note": str(item.get("note", "") or ""),
+                    }
+                    for item in rows
+                    if str(item.get("pmid", "")).strip()
+                ],
+            )
+
+    def get_included_papers(self, run_id: int) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT
+                    p.*,
+                    ip.include_flag,
+                    ip.tags,
+                    ip.note,
+                    ip.updated_at AS include_updated_at
+                FROM included_papers ip
+                JOIN papers p ON p.pmid = ip.pmid
+                WHERE ip.run_id = ? AND ip.include_flag = 1
+                ORDER BY CAST(COALESCE(NULLIF(p.pub_year, ''), '0') AS INTEGER) DESC, p.pmid DESC
+                """,
+                conn,
+                params=(run_id,),
+            )
+
+    def get_inclusion_table(self, run_id: int) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT
+                    p.pmid,
+                    p.title,
+                    p.journal,
+                    p.pub_year,
+                    COALESCE(ip.include_flag, 0) AS include_flag,
+                    COALESCE(ip.tags, '') AS tags,
+                    COALESCE(ip.note, '') AS note
+                FROM run_papers rp
+                JOIN papers p ON p.pmid = rp.pmid
+                LEFT JOIN included_papers ip ON ip.run_id = rp.run_id AND ip.pmid = rp.pmid
+                WHERE rp.run_id = ?
+                ORDER BY CAST(COALESCE(NULLIF(p.pub_year, ''), '0') AS INTEGER) DESC, p.pmid DESC
+                """,
+                conn,
+                params=(run_id,),
+            )
+
     def delete_run(self, run_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM topic_candidates WHERE run_id = ?", (run_id,))
+            conn.execute("DELETE FROM included_papers WHERE run_id = ?", (run_id,))
             conn.execute("DELETE FROM run_papers WHERE run_id = ?", (run_id,))
             conn.execute("DELETE FROM search_runs WHERE id = ?", (run_id,))
             conn.execute(
@@ -350,6 +430,7 @@ class Repository:
     def clear_history(self) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM topic_candidates")
+            conn.execute("DELETE FROM included_papers")
             conn.execute("DELETE FROM run_papers")
             conn.execute("DELETE FROM search_runs")
             conn.execute("DELETE FROM papers")

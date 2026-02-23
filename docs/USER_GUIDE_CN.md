@@ -109,7 +109,9 @@ streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 
 ### 6.5 Topic Ideas
 
-- 生成候选选题（带理由、证据缺口、支持 PMID）
+- 一键生成“最终选题版本”：规则引擎 + 可选LLM增强（非双轨展示）
+- 输出每个选题的理由、证据缺口、支持 PMID
+- 可下载 Topic Evidence JSONL 供外部模型复核
 - 可调三类权重：
   - `Clinical value`
   - `Innovation`
@@ -180,6 +182,6 @@ streamlit run app.py --server.port 8502
 
 ## 11. 版本说明（当前）
 
-- 版本：V1（选题发现）
-- 已实现：检索、证据图谱、趋势、候选题重排
-- 待扩展：数据库挖掘模板、候选题报告导出、写作工作台
+- 版本：V1
+- 已实现：检索、证据图谱、趋势、手动纳入集、规则引擎+LLM一体化选题
+- 后续建议：句级证据映射、Word导出、审稿规则检查

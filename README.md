@@ -1,6 +1,6 @@
 # Clinical Topic Discovery (V1)
 
-A lightweight Streamlit app for early-stage clinical topic discovery before writing an original paper.
+A lightweight Streamlit app for clinical topic discovery and evidence-backed topic planning.
 
 ## What V1 does
 
@@ -10,10 +10,10 @@ A lightweight Streamlit app for early-stage clinical topic discovery before writ
 - Build a structured local evidence library (SQLite)
 - Generate evidence landscape views (disease/intervention/outcome/study-design signals)
 - Surface trend insights and emerging terms
-- Produce candidate topic ideas with supporting PMIDs
-- Re-rank topic ideas with configurable weights (clinical value / innovation / feasibility)
+- Manage a manual included-paper set directly in V1
+- Generate final topic ideas with supporting PMIDs
+- Optionally enhance topic ideas with OpenAI-compatible LLM while keeping evidence-linked output
 - Sort results by publication year, citation count, JCR IF, CAS major tier, or journal impact proxy
-- View full abstract from the built-in abstract viewer
 
 ## Project structure
 
@@ -23,6 +23,8 @@ clinical_topic_discovery/
   requirements.txt
   core/
     analyzer.py
+    jcr_integration.py
+    llm_writer.py
     pubmed_client.py
     query_builder.py
     repository.py
@@ -44,14 +46,9 @@ streamlit run app.py
 
 Then open the local URL shown by Streamlit (usually `http://localhost:8501`).
 
-## Documentation
-
-- Chinese user guide: `docs/USER_GUIDE_CN.md`
-
 ## Notes
 
 - Optional: add your NCBI email/api_key in the sidebar for better API limits.
 - In `Search Results`, use `Fetch JCR IF` / `Fetch CAS partition` to integrate ShowJCR database (auto-download to `data/showjcr_jcr.db`).
-- Topic scoring weights are adjusted in the `Topic Ideas` tab (for the selected run).
-- V1 focuses on discovery and evidence synthesis, not manuscript drafting yet.
+- In `Topic Ideas`, you can export evidence package JSONL and call LLM enhancement in-page.
 - Data is stored locally in `data/app.db`.

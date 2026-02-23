@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -15,11 +16,11 @@ from core.jcr_integration import (
     match_papers_with_cas,
     match_papers_with_jcr,
 )
+from core.llm_writer import call_openai_compatible, enhance_topic_ideas_with_llm
 from core.pubmed_client import PubMedClient
 from core.query_builder import ARTICLE_TYPE_MAP, build_query
 from core.repository import Repository
 from core.topic_generator import DEFAULT_SCORE_WEIGHTS, generate_topic_candidates
-
 
 APP_ROOT = Path(__file__).parent
 DATA_DIR = APP_ROOT / "data"
@@ -35,12 +36,13 @@ def get_repo() -> Repository:
 def render_metric_row(df: pd.DataFrame) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Papers", len(df))
-    c2.metric("Unique Journals", df["journal"].nunique())
+    c2.metric("Unique Journals", int(df["journal"].nunique()))
 
     year_series = pd.to_numeric(df["pub_year"], errors="coerce").dropna()
     c3.metric("Median Year", int(year_series.median()) if not year_series.empty else "-")
 
-    c4.metric("With DOI", int(df["doi"].fillna("").astype(str).str.len().gt(0).sum()))
+    with_doi = int(df["doi"].fillna("").astype(str).str.len().gt(0).sum())
+    c4.metric("With DOI", with_doi)
 
 
 def bar_chart(df: pd.DataFrame, title: str, top_n: int = 12) -> None:
@@ -149,8 +151,6 @@ def run_search(repo: Repository, score_weights: dict[str, float]) -> int | None:
         keyword_mode=("pubmed_default" if keyword_mode.startswith("PubMed default") else "field_restricted"),
     )
 
-    st.session_state["last_query"] = query
-
     client = PubMedClient(email=email.strip(), api_key=api_key.strip())
 
     with st.spinner("Searching PubMed and preparing analysis..."):
@@ -166,30 +166,17 @@ def run_search(repo: Repository, score_weights: dict[str, float]) -> int | None:
         abstracts = client.fetch_abstract_metadata(pmids)
         records = client.merge_records(pmids, summaries, abstracts)
 
-        try:
-            run_id = repo.create_run(
-                project_name=project_name.strip(),
-                raw_query=keywords.strip(),
-                expanded_query=query,
-                start_year=int(start_year),
-                end_year=int(end_year),
-                article_types=selected_types,
-                max_results=int(max_results),
-                total_results=total_found,
-                score_weights=score_weights,
-            )
-        except TypeError:
-            # Backward compatibility for stale Streamlit worker using older Repository signature.
-            run_id = repo.create_run(
-                project_name=project_name.strip(),
-                raw_query=keywords.strip(),
-                expanded_query=query,
-                start_year=int(start_year),
-                end_year=int(end_year),
-                article_types=selected_types,
-                max_results=int(max_results),
-                total_results=total_found,
-            )
+        run_id = repo.create_run(
+            project_name=project_name.strip(),
+            raw_query=keywords.strip(),
+            expanded_query=query,
+            start_year=int(start_year),
+            end_year=int(end_year),
+            article_types=selected_types,
+            max_results=int(max_results),
+            total_results=total_found,
+            score_weights=score_weights,
+        )
 
         repo.upsert_papers(records)
         repo.link_run_papers(run_id, [r["pmid"] for r in records])
@@ -222,10 +209,32 @@ def _format_created_at_local(created_at: str) -> str:
     return str(parsed.tz_convert(local_tz).strftime("%Y-%m-%d %H:%M:%S"))
 
 
+def _translate_abstract_to_zh(
+    abstract_text: str,
+    api_base: str,
+    api_key: str,
+    model_name: str,
+) -> str:
+    prompt = (
+        "Translate the following medical abstract into professional academic Chinese. "
+        "Keep all facts, numbers, p-values, abbreviations, and drug names accurate. "
+        "Do not add, remove, or infer information beyond the original text.\n\n"
+        f"Abstract:\n{abstract_text}"
+    )
+    return call_openai_compatible(
+        api_base=api_base,
+        api_key=api_key,
+        model_name=model_name,
+        prompt=prompt,
+        temperature=0.0,
+        timeout=180,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Clinical Topic Discovery", page_icon="🩺", layout="wide")
     st.title("Clinical Topic Discovery")
-    st.caption("V1: PubMed-based topic discovery for clinical paper planning")
+    st.caption("V1: PubMed discovery + evidence-backed topic ideas")
 
     repo = get_repo()
     default_search_weights = dict(DEFAULT_SCORE_WEIGHTS)
@@ -240,10 +249,11 @@ def main() -> None:
     runs = runs.copy()
     runs["created_at_local"] = runs["created_at"].astype(str).apply(_format_created_at_local)
 
-    with st.expander("History Management", expanded=False):
-        st.caption("Use these actions to keep the run list short and clean.")
-        confirm_clear = st.checkbox("I understand this will permanently delete all run history.", key="confirm_clear_all")
-        if st.button("Clear all history", key="clear_all_history_btn"):
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Run Context")
+    with st.sidebar.expander("History Management", expanded=False):
+        confirm_clear = st.checkbox("Confirm clear all history", key="sb_confirm_clear_all")
+        if st.button("Clear all history", key="sb_clear_all_history_btn"):
             if confirm_clear:
                 repo.clear_history()
                 st.success("All history cleared.")
@@ -251,7 +261,7 @@ def main() -> None:
             else:
                 st.warning("Please confirm before clearing all history.")
 
-    filter_text = st.text_input("Filter runs (project/query)", value="", placeholder="Type to filter history list")
+    filter_text = st.sidebar.text_input("Filter runs", value="", placeholder="project/query", key="sb_filter_runs")
     run_view = runs
     if filter_text.strip():
         mask = (
@@ -264,39 +274,36 @@ def main() -> None:
         st.warning("No history matches current filter.")
         return
 
-    max_default = min(50, len(run_view))
-    show_limit = st.number_input("Show recent runs", min_value=1, max_value=max(1, len(run_view)), value=max_default, step=1)
+    show_limit = st.sidebar.number_input(
+        "Show recent", min_value=1, max_value=max(1, len(run_view)), value=min(40, len(run_view)), step=1
+    )
     run_view = run_view.head(int(show_limit))
 
     run_options = run_view["id"].tolist()
-    default_idx = 0
-    if new_run_id and new_run_id in run_options:
-        default_idx = run_options.index(new_run_id)
+    default_idx = run_options.index(new_run_id) if new_run_id in run_options else 0
 
-    selected_run_id = st.selectbox(
-        "Select analysis run",
+    selected_run_id = st.sidebar.selectbox(
+        "Select run",
         options=run_options,
         index=default_idx,
+        key="sb_select_run",
         format_func=lambda rid: (
-            f"Run #{rid} | "
-            f"{run_view.loc[run_view['id'] == rid, 'project_name'].iloc[0]} | "
+            f"#{rid} | {run_view.loc[run_view['id'] == rid, 'project_name'].iloc[0]} | "
             f"{run_view.loc[run_view['id'] == rid, 'created_at_local'].iloc[0]}"
         ),
     )
 
-    col_delete, col_confirm = st.columns([1, 3])
-    with col_confirm:
-        confirm_delete = st.checkbox("Confirm delete selected run", key=f"confirm_delete_run_{selected_run_id}")
-    with col_delete:
-        if st.button("Delete selected run", key=f"delete_run_btn_{selected_run_id}"):
-            if confirm_delete:
-                repo.delete_run(int(selected_run_id))
-                st.success(f"Run #{selected_run_id} deleted.")
-                st.rerun()
-            else:
-                st.warning("Please confirm deletion first.")
+    delete_confirm = st.sidebar.checkbox("Confirm delete selected run", key=f"sb_confirm_delete_{selected_run_id}")
+    if st.sidebar.button("Delete selected run", key=f"sb_delete_run_btn_{selected_run_id}"):
+        if delete_confirm:
+            repo.delete_run(int(selected_run_id))
+            st.success(f"Run #{selected_run_id} deleted.")
+            st.rerun()
+        else:
+            st.warning("Please confirm deletion first.")
 
     run_info = runs[runs["id"] == selected_run_id].iloc[0]
+    st.markdown(f"**Current Run**: `#{selected_run_id}` | **Project**: `{run_info['project_name']}`")
     st.markdown(f"**Query**: `{run_info['expanded_query']}`")
 
     df = repo.get_run_papers(int(selected_run_id))
@@ -333,14 +340,29 @@ def main() -> None:
                 st.success(f"Updated CAS partition for {updated_cas} papers (journal-matched).")
                 st.rerun()
         with metric_c4:
-            st.caption(
-                "Citation count is from OpenAlex. JCR IF and CAS partition are integrated from ShowJCR's local jcr.db tables."
-            )
+            st.caption("Citation count from OpenAlex. JCR/CAS from ShowJCR local database.")
+
+        inclusion_df = repo.get_inclusion_table(int(selected_run_id))
+        inclusion_meta = inclusion_df[["pmid", "include_flag", "tags", "note"]].copy() if not inclusion_df.empty else pd.DataFrame(columns=["pmid", "include_flag", "tags", "note"])
+
+        base_table = df.copy()
+        base_table["pmid"] = base_table["pmid"].astype(str)
+        if not inclusion_meta.empty:
+            inclusion_meta["pmid"] = inclusion_meta["pmid"].astype(str)
+            base_table = base_table.merge(inclusion_meta, on="pmid", how="left")
+        else:
+            base_table["include_flag"] = 0
+            base_table["tags"] = ""
+            base_table["note"] = ""
+
+        base_table["include_flag"] = base_table["include_flag"].fillna(0).astype(int).astype(bool)
+        base_table["tags"] = base_table["tags"].fillna("").astype(str)
+        base_table["note"] = base_table["note"].fillna("").astype(str)
 
         years = sorted(pd.to_numeric(df["pub_year"], errors="coerce").dropna().astype(int).unique().tolist())
         selected_years = st.multiselect("Filter by year", options=years, default=years[-5:] if len(years) > 5 else years)
 
-        filtered = df.copy()
+        filtered = base_table.copy()
         if selected_years:
             filtered = filtered[pd.to_numeric(filtered["pub_year"], errors="coerce").isin(selected_years)]
 
@@ -408,12 +430,35 @@ def main() -> None:
                 "pubmed_url",
             ]
 
-        st.dataframe(view_df[show_cols], use_container_width=True, hide_index=True)
+        editable_cols = ["include_flag", "tags", "note"]
+        render_cols = ["include_flag", "tags", "note"] + show_cols
+        edited_view = st.data_editor(
+            view_df[render_cols],
+            use_container_width=True,
+            hide_index=True,
+            key=f"search_table_editor_{selected_run_id}",
+            disabled=[c for c in render_cols if c not in editable_cols],
+            column_config={
+                "include_flag": st.column_config.CheckboxColumn("Include"),
+                "tags": st.column_config.TextColumn("Tags", help="e.g. background;methods;gap"),
+                "note": st.column_config.TextColumn("Note"),
+            },
+        )
+
+        csave1, csave2 = st.columns([1, 3])
+        with csave1:
+            if st.button("Save inclusion changes", key=f"save_inclusion_{selected_run_id}"):
+                repo.save_included_papers(int(selected_run_id), edited_view[["pmid", "include_flag", "tags", "note"]].to_dict(orient="records"))
+                st.success("Inclusion set updated from current table view.")
+                st.rerun()
+        with csave2:
+            included_now = int(edited_view["include_flag"].sum()) if "include_flag" in edited_view.columns else 0
+            st.caption(f"Included in current view: {included_now}")
 
         st.markdown("**Abstract viewer**")
-        pmid_options = filtered["pmid"].astype(str).tolist()
+        pmid_options = view_df["pmid"].astype(str).tolist()
         selected_pmid = st.selectbox("Select PMID", options=pmid_options)
-        selected_row = filtered[filtered["pmid"].astype(str) == selected_pmid].iloc[0]
+        selected_row = view_df[view_df["pmid"].astype(str) == selected_pmid].iloc[0]
         st.markdown(f"**Title:** {selected_row['title']}")
         st.markdown(f"**Journal / Year:** {selected_row['journal']} / {selected_row['pub_year']}")
         st.markdown(
@@ -425,7 +470,42 @@ def main() -> None:
             f"Top={selected_row.get('cas_top', 'N/A')} | 年份={selected_row.get('cas_year', 'N/A')}"
         )
         st.markdown(f"**PMID link:** https://pubmed.ncbi.nlm.nih.gov/{selected_pmid}/")
-        st.text_area("Abstract", value=selected_row.get("abstract", "") or "No abstract text returned.", height=220)
+
+        abstract_text = selected_row.get("abstract", "") or "No abstract text returned."
+        st.text_area("Abstract", value=abstract_text, height=220)
+
+        tcol1, tcol2 = st.columns([1, 3])
+        with tcol1:
+            if st.button("Translate to Chinese", key=f"translate_abs_{selected_run_id}_{selected_pmid}"):
+                if not str(abstract_text).strip() or abstract_text == "No abstract text returned.":
+                    st.warning("No abstract text to translate.")
+                else:
+                    api_base = st.session_state.get("v1_ti_api_base", "")
+                    api_key = st.session_state.get("v1_ti_api_key", "")
+                    model_name = st.session_state.get("v1_ti_model_name", "")
+                    if not api_base or not api_key or not model_name:
+                        st.warning("Please configure LLM settings in Topic Ideas first.")
+                    else:
+                        with st.spinner("Translating abstract..."):
+                            try:
+                                zh_text = _translate_abstract_to_zh(
+                                    abstract_text=str(abstract_text),
+                                    api_base=str(api_base),
+                                    api_key=str(api_key),
+                                    model_name=str(model_name),
+                                )
+                                st.session_state[f"abs_zh_{selected_run_id}_{selected_pmid}"] = zh_text
+                                st.success("Chinese translation generated.")
+                            except Exception as exc:  # noqa: BLE001
+                                st.error(f"Translation failed: {exc}")
+        with tcol2:
+            if st.button("Clear translation", key=f"clear_abs_zh_{selected_run_id}_{selected_pmid}"):
+                st.session_state.pop(f"abs_zh_{selected_run_id}_{selected_pmid}", None)
+                st.rerun()
+
+        zh_key = f"abs_zh_{selected_run_id}_{selected_pmid}"
+        if zh_key in st.session_state and str(st.session_state.get(zh_key, "")).strip():
+            st.text_area("Abstract (Chinese)", value=st.session_state.get(zh_key, ""), height=220)
 
         st.download_button(
             "Download current papers CSV",
@@ -471,13 +551,12 @@ def main() -> None:
 
     with tab4:
         st.subheader("Candidate Research Topics")
+        st.caption("Integrated pipeline: rule engine + optional LLM enhancement -> final topic ideas")
 
         base_clinical = float(run_info.get("score_weight_clinical", DEFAULT_SCORE_WEIGHTS["clinical_value"]))
         base_innovation = float(run_info.get("score_weight_innovation", DEFAULT_SCORE_WEIGHTS["innovation"]))
         base_feasibility = float(run_info.get("score_weight_feasibility", DEFAULT_SCORE_WEIGHTS["feasibility"]))
 
-        st.markdown("**Re-score this run with custom weights**")
-        st.caption("These weights apply to the currently selected run only. They do not change search behavior.")
         c1, c2, c3 = st.columns(3)
         w_clinical = c1.slider("Clinical value", 0, 100, int(base_clinical * 100), 5, key=f"rw_c_{selected_run_id}")
         w_innovation = c2.slider("Innovation", 0, 100, int(base_innovation * 100), 5, key=f"rw_i_{selected_run_id}")
@@ -494,54 +573,104 @@ def main() -> None:
                 "feasibility": w_feasibility / weight_sum,
             }
 
-        st.caption(
-            f"Normalized: clinical={current_weights['clinical_value']:.2f}, "
-            f"innovation={current_weights['innovation']:.2f}, "
-            f"feasibility={current_weights['feasibility']:.2f}"
+        use_included_only = st.checkbox("Use only manually included papers if available", value=True, key=f"ti_use_included_{selected_run_id}")
+        included_df = repo.get_included_papers(int(selected_run_id))
+        base_df = included_df if use_included_only and not included_df.empty else df
+        st.caption(f"Evidence source: {'Included set' if (use_included_only and not included_df.empty) else 'Current run papers'} | records={len(base_df)}")
+
+        evidence_export_cols = [c for c in ["pmid", "title", "abstract", "journal", "pub_year", "publication_types", "mesh_terms", "keywords", "doi"] if c in base_df.columns]
+        st.download_button(
+            "Download topic evidence package (JSONL)",
+            data="\n".join(json.dumps(row, ensure_ascii=False) for row in base_df[evidence_export_cols].fillna("").to_dict(orient="records")).encode("utf-8"),
+            file_name=f"run_{selected_run_id}_topic_evidence.jsonl",
+            mime="application/json",
         )
 
-        live_topics = generate_topic_candidates(
-            df,
-            top_n=5,
-            score_weights=current_weights,
-            query_text=str(run_info.get("raw_query", "")) or str(run_info.get("expanded_query", "")),
-        )
+        enable_llm = st.checkbox("Enable LLM enhancement", value=False, key=f"ti_enable_llm_{selected_run_id}")
+        llm_error = ""
+        api_base = ""
+        api_key = ""
+        model_name = ""
+        temperature = 0.1
 
-        if st.button("Save current ranking to this run", key=f"save_rescore_btn_{selected_run_id}"):
-            repo.save_topic_candidates(int(selected_run_id), live_topics)
-            st.success("Saved current ranking.")
+        if enable_llm:
+            with st.expander("LLM settings", expanded=True):
+                api_base = st.text_input("API base URL", value=st.session_state.get("v1_ti_api_base", "https://api.openai.com/v1"), key=f"ti_api_base_{selected_run_id}")
+                model_name = st.text_input("Model name", value=st.session_state.get("v1_ti_model_name", "gpt-4o-mini"), key=f"ti_model_{selected_run_id}")
+                api_key = st.text_input("API key", type="password", value=st.session_state.get("v1_ti_api_key", ""), key=f"ti_api_key_{selected_run_id}")
+                temperature = st.slider("LLM temperature", min_value=0.0, max_value=0.8, value=0.1, step=0.05, key=f"ti_temp_{selected_run_id}")
+                st.session_state["v1_ti_api_base"] = api_base
+                st.session_state["v1_ti_model_name"] = model_name
+                st.session_state["v1_ti_api_key"] = api_key
+                st.caption("Medical prompt enforces evidence-grounded output with PMID support.")
 
-        if not live_topics:
-            st.info("No topic candidates generated. Try broader filters or a larger sample.")
-        else:
-            score_table = pd.DataFrame(
-                [
-                    {
-                        "rank": idx + 1,
-                        "topic": t["topic_title"],
-                        "score": t["score"],
-                        "clinical": t["component_clinical_value"],
-                        "innovation": t["component_innovation"],
-                        "feasibility": t["component_feasibility"],
-                    }
-                    for idx, t in enumerate(live_topics)
-                ]
+        if st.button("Generate final topic ideas", type="primary", key=f"ti_generate_{selected_run_id}"):
+            rule_topics = generate_topic_candidates(
+                base_df,
+                top_n=5,
+                score_weights=current_weights,
+                query_text=str(run_info.get("raw_query", "")) or str(run_info.get("expanded_query", "")),
             )
-            st.dataframe(score_table, use_container_width=True, hide_index=True)
 
-            for idx, topic in enumerate(live_topics):
-                with st.container(border=True):
-                    st.markdown(f"### {idx + 1}. {topic['topic_title']}")
-                    st.markdown(f"**Priority score:** {topic['score']}")
-                    st.markdown(
-                        "**Component scores:** "
-                        f"Clinical={topic.get('component_clinical_value', '-')}, "
-                        f"Innovation={topic.get('component_innovation', '-')}, "
-                        f"Feasibility={topic.get('component_feasibility', '-')}"
+            final_topics = rule_topics
+            if enable_llm:
+                try:
+                    evidence_records = base_df[evidence_export_cols].fillna("").to_dict(orient="records")
+                    llm_topics = enhance_topic_ideas_with_llm(
+                        api_base=api_base,
+                        api_key=api_key,
+                        model_name=model_name,
+                        query_text=str(run_info.get("raw_query", "")) or str(run_info.get("expanded_query", "")),
+                        rule_topics=rule_topics,
+                        evidence_records=evidence_records,
+                        top_n=5,
+                        temperature=float(temperature),
                     )
-                    st.markdown(f"**Why this topic:** {topic['rationale']}")
-                    st.markdown(f"**Potential gap:** {topic['key_gap']}")
-                    st.markdown(f"**Supporting PMIDs:** {'; '.join(topic['supporting_pmids'])}")
+
+                    score_lookup = {t.get("topic_title", ""): t for t in rule_topics}
+                    merged_topics = []
+                    for idx, item in enumerate(llm_topics):
+                        base_match = score_lookup.get(item.get("topic_title", ""), {})
+                        merged_topics.append(
+                            {
+                                "topic_title": item.get("topic_title", ""),
+                                "rationale": item.get("rationale", ""),
+                                "key_gap": item.get("key_gap", ""),
+                                "score": float(item.get("score", base_match.get("score", max(0, 95 - idx * 8)))),
+                                "component_clinical_value": float(base_match.get("component_clinical_value", 0)),
+                                "component_innovation": float(base_match.get("component_innovation", 0)),
+                                "component_feasibility": float(base_match.get("component_feasibility", 0)),
+                                "supporting_pmids": item.get("supporting_pmids", []) or base_match.get("supporting_pmids", []),
+                            }
+                        )
+                    final_topics = merged_topics if merged_topics else rule_topics
+                except Exception as exc:  # noqa: BLE001
+                    llm_error = str(exc)
+                    final_topics = rule_topics
+
+            repo.save_topic_candidates(int(selected_run_id), final_topics)
+            st.session_state[f"ti_generation_msg_{selected_run_id}"] = "Generated and saved final topic ideas."
+            st.session_state[f"ti_generation_err_{selected_run_id}"] = llm_error
+            st.rerun()
+
+        msg = st.session_state.get(f"ti_generation_msg_{selected_run_id}", "")
+        err = st.session_state.get(f"ti_generation_err_{selected_run_id}", "")
+        if msg:
+            st.success(msg)
+        if err:
+            st.warning(f"LLM enhancement fallback to rule engine: {err}")
+
+        topic_df = repo.get_topic_candidates(int(selected_run_id))
+        if topic_df.empty:
+            st.info("No topic candidates yet. Click 'Generate final topic ideas'.")
+        else:
+            for idx, row in topic_df.iterrows():
+                with st.container(border=True):
+                    st.markdown(f"### {idx + 1}. {row['topic_title']}")
+                    st.markdown(f"**Priority score:** {row.get('score', '-')}")
+                    st.markdown(f"**Why this topic:** {row.get('rationale', '')}")
+                    st.markdown(f"**Potential gap:** {row.get('key_gap', '')}")
+                    st.markdown(f"**Supporting PMIDs:** {row.get('supporting_pmids', '')}")
 
 
 if __name__ == "__main__":
